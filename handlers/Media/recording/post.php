@@ -9,10 +9,19 @@ function Media_recording_post($params = array())
 		$publisherId = Q::ifset($params, 'publisherId', $loggedInUserId);
 		$streamName = Q::ifset($params, 'streamName', null);
 
-		$webrtcStream = Streams_Stream::fetch($publisherId, $publisherId, $streamName);
+		// ro#931: fetched as the logged-in user, not as the request's
+		// publisherId, and only a Media/webrtc room is recorded. Relating
+		// the recording to it below checks "relate" as the logged-in user.
+		$webrtcStream = Streams_Stream::fetch($loggedInUserId, $publisherId, $streamName);
 
 		if (!$webrtcStream) {
 			throw new Q_Exception("Please pass WebRTC stream's name and publisher id as params for this request.");
+		}
+		if ($webrtcStream->type !== 'Media/webrtc') {
+			throw new Q_Exception_WrongType(array(
+				'field' => 'streamName',
+				'type' => 'a Media/webrtc stream'
+			));
 		}
 
 		$response = [];
@@ -79,6 +88,16 @@ function Media_recording_post($params = array())
 			throw new Exception('path is not valid');
 		}
 
+		// ro#931: $path is a stream attribute, which the stream's publisher
+		// can write through Streams/stream PUT, and it reaches a shell
+		// command below. No parent segments, and every argument is escaped.
+		if (strpos($path, '..') !== false) {
+			throw new Q_Exception_WrongValue(array(
+				'field' => 'path',
+				'range' => 'a path without ..'
+			));
+		}
+
 		$appName = Q::app();
 
 		$folderPath = APP_DIR . '/files/' . $appName . $path . '/';
@@ -106,7 +125,8 @@ function Media_recording_post($params = array())
 		//file_put_contents($outputFilePath, implode(PHP_EOL, $fileLines));
 		$pathData = explode('/', $files[count($files) - 1]);
 		$fileName = $pathData[count($pathData) - 1];
-		$cmd = "cat " . implode(' ', $files) . " > $folderPath$fileName.webm 2>&1; echo $?";
+		$cmd = "cat " . implode(' ', array_map('escapeshellarg', $files))
+			. " > " . escapeshellarg("$folderPath$fileName.webm") . " 2>&1; echo $?";
 		$combineResult = shell_exec($cmd);
 		if (!file_exists($folderPath . "$fileName.webm")) {
 			throw new Exception($combineResult);

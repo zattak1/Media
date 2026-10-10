@@ -49,7 +49,11 @@ function Media_livestream_post($params = array())
 			throw new Exception("publisherId, streamName and action should be specified");
 		}
 
-		$livestreamStream = Streams_Stream::fetch($publisherId, $publisherId, $streamName);
+		// ro#931: fetched as the logged-in user. Fetched as its publisher, the
+		// stream carried the publisher's access, so subscribe() (which checks
+		// the access on the object it is given) let anyone subscribe to any
+		// stream and receive its messages.
+		$livestreamStream = Streams_Stream::fetch($loggedInUserId, $publisherId, $streamName, true);
 
 		if($action === 'set') {
 			$livestreamStream->subscribe();

@@ -12,7 +12,11 @@ abstract class Media_Livestream
 
     static function createOrUpdateLivestreamStream($publisherId, $streamName, $time) {
         $loggedInUserId = Users::loggedInUser(true)->id;
-        $webrtcStream = Streams_Stream::fetch($publisherId, $publisherId, $streamName);
+        // ro#931: fetched as the logged-in user (it was fetched as the
+        // request's publisherId, which only proved the stream exists and
+        // read its scheduledStartTime for anyone). Relating the livestream
+        // below still checks "relate" on it as the logged-in user.
+        $webrtcStream = Streams_Stream::fetch($loggedInUserId, $publisherId, $streamName);
 
 		if (!$webrtcStream) {
 			throw new Q_Exception("Please pass WebRTC stream's name and publisher id as params for this request.");
@@ -124,7 +128,11 @@ abstract class Media_Livestream
     }
 
 	static function updateReminders($publisherId, $streamName, $reminderTime, $action) {
-        $livestreamStream = Streams_Stream::fetch($publisherId, $publisherId, $streamName);
+        // ro#931: fetched as the logged-in user, whom join() below acts for.
+        // Fetched as its publisher, the object carried the publisher's
+        // access, and Streams::join() checks the object it is given, so
+        // anyone joined and subscribed to any stream.
+        $livestreamStream = Streams_Stream::fetch(Users::loggedInUser(true)->id, $publisherId, $streamName, true);
 
 		$meAsParticipant = $livestreamStream->participant();
         if (!$meAsParticipant || $meAsParticipant->fields['state'] != 'participating') {

@@ -87,31 +87,59 @@ function Media_callCenter_post($params = array())
 
     $loggedInUser = Users::loggedInUser(true);
 	$loggedInUserId = $loggedInUser->id;
+	// ro#931: every slot below acts as the logged-in user. The request's
+	// "publisherId" only names a target stream (makeCallCenterFromStream,
+	// closeIfOffline); it is never the user who posts, closes or publishes.
+	// The data slot above is Node's, signature-checked; these are browser
+	// requests, so they need the nonce (Q_Response checks it for AJAX only).
+	Q_Valid::nonce(true);
 	$publisherId = Q::ifset($params, 'publisherId', $loggedInUserId);
     if(Q_Request::slotName('makeCallCenterFromStream')) {
         // makeCallCenterFromStream means giving access to this stream for Users/hosts
 
-        $webrtcStream = Streams_Stream::fetch($loggedInUserId, $publisherId, $streamName);
+        $webrtcStream = Streams_Stream::fetch($loggedInUserId, $publisherId, $streamName, true);
 
+        // ro#931: this check was inverted (`if (!testAdminLevel('manage'))`),
+        // so the Users/hosts row was written on streams the caller does NOT
+        // manage, and never on the manager's own. Only a manager may open a
+        // stream to the publisher's Users/hosts.
         if(!$webrtcStream->testAdminLevel('manage')) {
-            $access = new Streams_Access();
-            $access->publisherId = $publisherId;
-            $access->streamName = $streamName;
-            $access->ofContactLabel = 'Users/hosts';
-            if (!$access->retrieve()) {
-                $access->readLevel = Streams::$READ_LEVEL['max'];
-                $access->writeLevel = Streams::$WRITE_LEVEL['max'];
-                $access->adminLevel = Streams::$ADMIN_LEVEL['invite'];
-                $access->save();
-            }
+            throw new Users_Exception_NotAuthorized();
         }
-    
+        $access = new Streams_Access();
+        $access->publisherId = $publisherId;
+        $access->streamName = $streamName;
+        $access->ofContactLabel = 'Users/hosts';
+        if (!$access->retrieve()) {
+            $access->readLevel = Streams::$READ_LEVEL['max'];
+            $access->writeLevel = Streams::$WRITE_LEVEL['max'];
+            $access->adminLevel = Streams::$ADMIN_LEVEL['invite'];
+            $access->save();
+        }
+
         return Q_Response::setSlot("makeCallCenterFromStream", 'done');
     } else if(Q_Request::slotName('closeIfOffline')) {
         if ($loggedInUser) {
+            // ro#931: both branches end with the stream closed as its
+            // publisher (here, or in the signed data slot after Node reports
+            // the socket offline, and a caller can name any socketId), which
+            // skips Streams::close()'s own check. So any logged-in user
+            // closed any stream. Require the call's own type and the close
+            // write level as the caller first. A call center's operators
+            // have it: the call is related to the call center with
+            // inheritAccess (room slot below).
+            $webrtcStream = Streams_Stream::fetch($loggedInUserId, $publisherId, $streamName, true);
+            if ($webrtcStream->type !== 'Media/webrtc') {
+                throw new Q_Exception_WrongType(array(
+                    'field' => 'streamName',
+                    'type' => 'a Media/webrtc stream'
+                ));
+            }
+            if (!$webrtcStream->testWriteLevel('close')) {
+                throw new Users_Exception_NotAuthorized();
+            }
             if(is_null($socketId)) {
-                $webrtcStream = Streams_Stream::fetch(null, $publisherId, $streamName);
-                $webrtcStream->close($publisherId);
+                $webrtcStream->close($loggedInUserId);
                 $webrtcStream->changed();
             } else {
                 // check if any participants in the call are online
@@ -142,12 +170,7 @@ function Media_callCenter_post($params = array())
             throw new Exception('waitingRoom and liveShowRoom are required');
         }
 
-        $waitingRoomStream = Streams::fetchOne($loggedInUserId, $waitingRoom['publisherId'], $waitingRoom['streamName']);
-        $liveShowRoomStream = Streams::fetchOne($loggedInUserId, $liveShowRoom['publisherId'], $liveShowRoom['streamName']);
-
-        if(!$waitingRoomStream || !$liveShowRoomStream) {
-            throw new Exception('Streams not found');
-        }
+        list($waitingRoomStream, $liveShowRoomStream) = Media_callCenter_post_rooms($loggedInUserId, $waitingRoom, $liveShowRoom);
 
         $status = $waitingRoomStream->getAttribute('status');
 
@@ -169,7 +192,7 @@ function Media_callCenter_post($params = array())
             $access->save();
         }
     
-        $waitingRoomStream->post($publisherId, array(
+        $waitingRoomStream->post($loggedInUserId, array(
             'type' => 'Media/webrtc/accepted',
             'instructions' => [
                 'msg' => 'Your call request was accepted'
@@ -181,7 +204,7 @@ function Media_callCenter_post($params = array())
         $waitingRoomStream->changed();
         //$waitingRoomStream->save();
 
-        $liveShowRoomStream->post($publisherId, array(
+        $liveShowRoomStream->post($loggedInUserId, array(
             'type' => 'Media/webrtc/accepted',
             'instructions' => [
                 'waitingRoom' => $waitingRoom,
@@ -200,12 +223,7 @@ function Media_callCenter_post($params = array())
             throw new Exception('$waitingRoom, $liveShowRoom and $action are required');
         }
 
-        $waitingRoomStream = Streams::fetchOne($loggedInUserId, $waitingRoom['publisherId'], $waitingRoom['streamName']);
-        $liveShowRoomStream = Streams::fetchOne($loggedInUserId, $liveShowRoom['publisherId'], $liveShowRoom['streamName']);
-
-        if(!$waitingRoomStream || !$liveShowRoomStream) {
-            throw new Exception('Streams not found');
-        }
+        list($waitingRoomStream, $liveShowRoomStream) = Media_callCenter_post_rooms($loggedInUserId, $waitingRoom, $liveShowRoom);
 
         $status = $waitingRoomStream->getAttribute('status');
 
@@ -234,7 +252,7 @@ function Media_callCenter_post($params = array())
             $instructions['msg'] = 'Your call request was declined';
         }
     
-        $waitingRoomStream->post($publisherId, array(
+        $waitingRoomStream->post($loggedInUserId, array(
             'type' => $messageType,
             'instructions' => $instructions
         ));
@@ -244,7 +262,7 @@ function Media_callCenter_post($params = array())
         $waitingRoomStream->changed();
         //$waitingRoomStream->save();
 
-        $liveShowRoomStream->post($publisherId, array(
+        $liveShowRoomStream->post($loggedInUserId, array(
             'type' => $messageType,
             'instructions' => [
                 'waitingRoom' => $waitingRoom,
@@ -252,6 +270,9 @@ function Media_callCenter_post($params = array())
             ]
         ));
 
+        // Still closed as its publisher, but only after
+        // Media_callCenter_post_rooms() checked that the caller manages the
+        // call center and that this waiting room is a call placed with it.
         $waitingRoomStream->close($waitingRoom['publisherId']);
 
         return Q_Response::setSlot("endOrDeclineCallHandler", 'done');
@@ -264,12 +285,7 @@ function Media_callCenter_post($params = array())
             throw new Exception('$waitingRoom, $liveShowRoom and $action are required');
         }
 
-        $waitingRoomStream = Streams::fetchOne($loggedInUserId, $waitingRoom['publisherId'], $waitingRoom['streamName']);
-        $liveShowRoomStream = Streams::fetchOne($loggedInUserId, $liveShowRoom['publisherId'], $liveShowRoom['streamName']);
-
-        if(!$waitingRoomStream || !$liveShowRoomStream) {
-            throw new Exception('Streams not found');
-        }
+        list($waitingRoomStream, $liveShowRoomStream) = Media_callCenter_post_rooms($loggedInUserId, $waitingRoom, $liveShowRoom);
 
         $status = $waitingRoomStream->getAttribute('status');
 
@@ -277,7 +293,7 @@ function Media_callCenter_post($params = array())
             throw new Exception('Another manager already changed status of this call');
         }
 
-        $waitingRoomStream->post($publisherId, array(
+        $waitingRoomStream->post($loggedInUserId, array(
             'type' => 'Media/webrtc/interview',
             'instructions' => ['msg' => 'Operator started interview with you']
         ));
@@ -287,7 +303,7 @@ function Media_callCenter_post($params = array())
         $waitingRoomStream->changed();
         //$waitingRoomStream->save();
 
-        $liveShowRoomStream->post($publisherId, array(
+        $liveShowRoomStream->post($loggedInUserId, array(
             'type' => 'Media/webrtc/interview',
             'instructions' => [
                 'waitingRoom' => $waitingRoom,
@@ -306,19 +322,14 @@ function Media_callCenter_post($params = array())
             throw new Exception('$waitingRoom, $liveShowRoom and $action are required');
         }
 
-        $waitingRoomStream = Streams::fetchOne($loggedInUserId, $waitingRoom['publisherId'], $waitingRoom['streamName']);
-        $liveShowRoomStream = Streams::fetchOne($loggedInUserId, $liveShowRoom['publisherId'], $liveShowRoom['streamName']);
-
-        if(!$waitingRoomStream || !$liveShowRoomStream) {
-            throw new Exception('Streams not found');
-        }
+        list($waitingRoomStream, $liveShowRoomStream) = Media_callCenter_post_rooms($loggedInUserId, $waitingRoom, $liveShowRoom);
 
         $waitingRoomStream->setAttribute('isApproved', $isApproved);
         $waitingRoomStream->setAttribute('isApprovedByUserId', $loggedInUserId);
         $waitingRoomStream->changed();
         //$waitingRoomStream->save();
 
-        $liveShowRoomStream->post($publisherId, array(
+        $liveShowRoomStream->post($loggedInUserId, array(
             'type' => 'Media/webrtc/approved',
             'instructions' => [
                 'waitingRoom' => $waitingRoom,
@@ -337,14 +348,9 @@ function Media_callCenter_post($params = array())
             throw new Exception('$waitingRoom, $liveShowRoom and $action are required');
         }
 
-        $waitingRoomStream = Streams::fetchOne($loggedInUserId, $waitingRoom['publisherId'], $waitingRoom['streamName']);
-        $liveShowRoomStream = Streams::fetchOne($loggedInUserId, $liveShowRoom['publisherId'], $liveShowRoom['streamName']);
+        list($waitingRoomStream, $liveShowRoomStream) = Media_callCenter_post_rooms($loggedInUserId, $waitingRoom, $liveShowRoom);
 
-        if(!$waitingRoomStream || !$liveShowRoomStream) {
-            throw new Exception('Streams not found');
-        }
-
-        $waitingRoomStream->post($publisherId, array(
+        $waitingRoomStream->post($loggedInUserId, array(
             'type' => 'Media/webrtc/hold',
             'instructions' => [
                 'msg' => 'Your call was put on hold...',
@@ -358,7 +364,7 @@ function Media_callCenter_post($params = array())
         //$waitingRoomStream->changed();
         $waitingRoomStream->save();
 
-        $liveShowRoomStream->post($publisherId, array(
+        $liveShowRoomStream->post($loggedInUserId, array(
             'type' => 'Media/webrtc/hold',
             'instructions' => [
                 'waitingRoom' => $waitingRoom,
@@ -390,10 +396,45 @@ function Media_callCenter_post($params = array())
             )
         );
     
+        // ro#931: the caller's room is the caller's own. With a request
+        // "publisherId" this slot created (or reopened) a Media/webrtc stream
+        // as any user, then edited it, joined it, related it and registered
+        // Node's closeStream for it on disconnect. client.js, the only
+        // caller, sends its own id.
+        $publisherId = $loggedInUserId;
+
+        // ro#931: the call is related below AS THE CALL CENTER'S PUBLISHER
+        // (which skips the category's "relate" check: call centers are
+        // created with public writeLevel 0) and with inheritAccess. Keep
+        // that to what client.js does -- a call, into a Media/webrtc call
+        // center the caller can see -- rather than any relation type into
+        // any stream as its publisher. Checked before anything is written.
+        $callCenterStream = null;
+        if (!empty($relate["publisherId"]) && !empty($relate["streamName"]) && !empty($relate["relationType"])) {
+            if ($relate["relationType"] !== 'Media/webrtc/callCenter/call') {
+                throw new Q_Exception_WrongValue(array(
+                    'field' => 'relate.relationType',
+                    'range' => 'Media/webrtc/callCenter/call'
+                ));
+            }
+            $callCenterStream = Streams_Stream::fetch($loggedInUserId, $relate["publisherId"], $relate["streamName"], true);
+            if ($callCenterStream->type !== 'Media/webrtc') {
+                throw new Q_Exception_WrongType(array(
+                    'field' => 'relate.streamName',
+                    'type' => 'a Media/webrtc stream'
+                ));
+            }
+            if (!$callCenterStream->testReadLevel('content')) {
+                throw new Users_Exception_NotAuthorized();
+            }
+        }
+
         $webrtcStream = null;
         if(!empty($useRelatedTo) && !empty($useRelatedTo["publisherId"]) && !empty($useRelatedTo["streamName"]) && !empty($useRelatedTo["relationType"])) {
-    
-            $webrtcStream = Media_WebRTC::getRoomStreamRelatedTo($useRelatedTo["publisherId"], $useRelatedTo["streamName"], null, null, $useRelatedTo["relationType"], $resumeClosed);
+
+            // ro#931: only a room of the caller's own; with a null
+            // fromPublisherId this returned anyone's room related there.
+            $webrtcStream = Media_WebRTC::getRoomStreamRelatedTo($useRelatedTo["publisherId"], $useRelatedTo["streamName"], $loggedInUserId, null, $useRelatedTo["relationType"], $resumeClosed);
     
             if(is_null($webrtcStream)) {
                 $webrtcStream = Media_WebRTC::getOrCreateRoomStream($publisherId, $roomId, $resumeClosed, ['writeLevel' => $writeLevel]);
@@ -457,8 +498,7 @@ function Media_callCenter_post($params = array())
         $response['stream']->save(false, true, true);
 
 
-        if (!empty($relate["publisherId"]) && !empty($relate["streamName"]) && !empty($relate["relationType"])) {
-            $callCenterStream = Streams_Stream::fetch($loggedInUserId, $relate["publisherId"], $relate["streamName"]);
+        if ($callCenterStream) {
             $refetchedStream = Streams_Stream::fetch($callCenterStream->fields['publisherId'],  $webrtcStream->fields["publisherId"],  $webrtcStream->fields["name"], ['refetch' => true]);
 
             //var_dump($callCenterStream->testAdminLevel('manage'));die;
@@ -497,5 +537,60 @@ function Media_callCenter_post($params = array())
     
         return Q_Response::setSlot("room", $response);
     }
-    
+
+}
+
+/**
+ * ro#931: the operator slots (acceptHandler, endOrDeclineCallHandler,
+ * interviewHandler, markApprovedHandler, holdHandler) wrote or deleted access
+ * rows on a caller-named liveShowRoom, set attributes on, posted to and
+ * closed a caller-named waitingRoom, with no check that the caller operates
+ * either. This is that check: the caller manages the call center (the
+ * liveShowRoom, a Media/webrtc stream; the same level
+ * Media_WebRTC::admitUserToRoom() requires, which upstream's acceptHandler
+ * now calls), and the waitingRoom is a call placed with it -- related to it
+ * as Media/webrtc/callCenter/call, as the room slot does for client.js.
+ * @method Media_callCenter_post_rooms
+ * @param {string} $loggedInUserId
+ * @param {array} $waitingRoom publisherId, streamName
+ * @param {array} $liveShowRoom publisherId, streamName
+ * @return {array} array($waitingRoomStream, $liveShowRoomStream)
+ * @throws {Users_Exception_NotAuthorized}
+ */
+function Media_callCenter_post_rooms($loggedInUserId, $waitingRoom, $liveShowRoom)
+{
+    foreach (array('waitingRoom' => $waitingRoom, 'liveShowRoom' => $liveShowRoom) as $field => $room) {
+        if (!is_array($room) || empty($room['publisherId']) || empty($room['streamName'])) {
+            throw new Q_Exception_RequiredField(array(
+                'field' => "$field.publisherId, $field.streamName"
+            ));
+        }
+    }
+    $liveShowRoomStream = Streams_Stream::fetch($loggedInUserId, $liveShowRoom['publisherId'], $liveShowRoom['streamName'], true);
+    if ($liveShowRoomStream->type !== 'Media/webrtc') {
+        throw new Q_Exception_WrongType(array(
+            'field' => 'liveShowRoom',
+            'type' => 'a Media/webrtc stream'
+        ));
+    }
+    if (!$liveShowRoomStream->testAdminLevel('manage')) {
+        throw new Users_Exception_NotAuthorized();
+    }
+    $waitingRoomStream = Streams_Stream::fetch($loggedInUserId, $waitingRoom['publisherId'], $waitingRoom['streamName'], true);
+    if ($waitingRoomStream->type !== 'Media/webrtc') {
+        throw new Q_Exception_WrongType(array(
+            'field' => 'waitingRoom',
+            'type' => 'a Media/webrtc stream'
+        ));
+    }
+    $call = new Streams_RelatedTo();
+    $call->toPublisherId = $liveShowRoomStream->publisherId;
+    $call->toStreamName = $liveShowRoomStream->name;
+    $call->type = 'Media/webrtc/callCenter/call';
+    $call->fromPublisherId = $waitingRoomStream->publisherId;
+    $call->fromStreamName = $waitingRoomStream->name;
+    if (!$call->retrieve()) {
+        throw new Users_Exception_NotAuthorized();
+    }
+    return array($waitingRoomStream, $liveShowRoomStream);
 }

@@ -22,15 +22,29 @@ function Media_webrtc_put($params = array()) {
         $logsDirectory = str_replace('/', DS, Q_Config::get('Q', 'logs', 'directory', 'Q/logs'));
         $logsPath = (defined('APP_FILES_DIR') ? APP_FILES_DIR : Q_FILES_DIR).DS.$logsDirectory.DS.'webrtc';
 
+        // ro#931: the room is fetched as the logged-in user, who must be able
+        // to join it (it was fetched as the request's publisherId, so anyone
+        // wrote logs for any room), and every path segment is built from
+        // checked values. The folder came from "roomId" and the file name
+        // from "participant" split on a tab, both unsanitised: any logged-in
+        // user wrote a .log file anywhere PHP can write, and could mkdir
+        // there too.
         $streamName = "Media/webrtc/$roomId";
-        $stream = Streams_Stream::fetch($publisherId, $publisherId, $streamName);
+        $stream = Streams_Stream::fetch($loggedUserId, $publisherId, $streamName, true);
+        if (!$stream->testWriteLevel('join')) {
+            throw new Users_Exception_NotAuthorized();
+        }
         $startTime = date('YmdHis', round($stream->getAttribute('startTime') / 1000));
 
-        $folderName = $roomId . '_' . $startTime;
+        // '-' rather than '_', which removeOldLogs() splits the date on
+        $folderName = preg_replace('/[^A-Za-z0-9-]/', '-', $roomId) . '_' . $startTime;
 
         $path = $logsPath . DS . $folderName;
-        $participantInfo = preg_split('/\t/', $participant);
-        $filename = $participantInfo[0] . '_' . $participantInfo[1] . '.log';
+        // WebRTC.js sends "<loggedInUserId>\t<room start time>": the user is
+        // the logged-in one, and the time is digits only
+        $participantInfo = preg_split('/\t/', (string)$participant);
+        $participantTime = preg_replace('/[^0-9]/', '', (string)Q::ifset($participantInfo, 1, ''));
+        $filename = preg_replace('/[^A-Za-z0-9-]/', '-', $loggedUserId) . '_' . $participantTime . '.log';
         $mask = umask(0000);
 
         if (!file_exists($path)) {
